@@ -66,3 +66,32 @@ def test_duplicate_contacts_in_same_bundle_and_backup(tmp_path, monkeypatch):
     with sqlite3.connect(backup) as con:
         assert con.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
         assert con.execute('SELECT email FROM contacts').fetchone()[0] == 'marie@example.com'
+
+
+def test_backup_closes_connections_before_removing_temporary_directory(tmp_path, monkeypatch):
+    import sqlite3
+    import pytest
+    import tempfile
+    monkeypatch.setattr(storage, 'DB_PATH', tmp_path / 'original.sqlite3')
+    real_connect = sqlite3.connect
+    real_directory = tempfile.TemporaryDirectory
+    connections = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    class CheckedDirectory(real_directory):
+        def __exit__(self, *args):
+            # Linux autorise la suppression d'un fichier ouvert : vérifier
+            # explicitement la fermeture pour reproduire la contrainte Windows.
+            for connection in connections:
+                with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+                    connection.execute('SELECT 1')
+            return super().__exit__(*args)
+
+    monkeypatch.setattr(sqlite3, 'connect', tracked_connect)
+    monkeypatch.setattr(tempfile, 'TemporaryDirectory', CheckedDirectory)
+    assert storage.database_backup().startswith(b'SQLite format 3')
+    assert len(connections) == 2

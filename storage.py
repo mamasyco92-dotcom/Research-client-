@@ -143,9 +143,12 @@ def remove_contact(contact_id:int):
 
 def database_backup() -> bytes:
     """Instantané SQLite cohérent, y compris si le journal WAL est actif."""
+    from contextlib import closing
     import tempfile
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / 'recherches.sqlite3'
-        with connect() as source, sqlite3.connect(path) as target:
+        # Le contexte SQLite valide la transaction mais ne ferme pas le fichier.
+        # Fermer les deux connexions avant la suppression du dossier sous Windows.
+        with closing(connect()) as source, closing(sqlite3.connect(path)) as target:
             source.backup(target)
         return path.read_bytes()
