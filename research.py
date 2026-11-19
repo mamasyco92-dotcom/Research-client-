@@ -3,9 +3,9 @@ Aucune donnée (nom, email, AUM) n'est inventée ni déduite d'un format probabl
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date
+from io import BytesIO
 from urllib.parse import urljoin, urlparse, urldefrag, unquote
 from urllib import robotparser
 from collections import deque
@@ -16,6 +16,8 @@ import socket
 import unicodedata
 
 import requests
+from pypdf import PdfReader
+from pypdf.errors import PyPdfError
 from bs4 import BeautifulSoup
 from contact_quality import (person_name, role_label, quality_contact, shortlist,
                              in_target_division)
@@ -29,8 +31,14 @@ TIMEOUT = (5, 12)
 MAX_BYTES = 3_500_000
 # Plafond de sécurité technique, non paramétrable par l'utilisateur.
 MAX_PAGES = 36
+MAX_PDFS = 6
+MAX_PDF_PAGES = 12
+MAX_PDF_BYTES = 8_000_000
+MAX_FETCHES = 72
+PDF_LINK = re.compile(r'\.pdf$', re.I)
+PDF_TOPIC = re.compile(r'annual[\s_-]*report|rapport[\s_-]*annuel|fact[\s_-]*sheet|brochure|annuaire', re.I)
 IMPORTANT_PATH = re.compile(
-    r"team|people|person|about|who-we-are|our-team|leadership|direction|equipe|gestion|"
+    r"team|people|person|profil|biograph|\bbio\b|about|who-we-are|our-team|leadership|direction|equipe|gestion|"
     r"investment|investissement|fund|fonds|manager|selection|partners|contact|wealth|"
     r"portfol|strate|company|societe|notre-histoire|expertise|governance|governance|"
     r"committee|comite|approach|approche|research|recherche|asset|service",
@@ -88,6 +96,7 @@ class Page:
     title: str = ''
     description: str = ''
     links: list[tuple[str,str]] = field(default_factory=list)
+    pdf_contacts: list[dict] | None = None
 
 
 def _clean(s: str) -> str:
@@ -139,28 +148,37 @@ def same_site(url: str, domain: str) -> bool:
     return hostname == domain or hostname == 'www.' + domain or hostname.endswith('.' + domain)
 
 
-def download_html(url: str, session: requests.Session) -> str | None:
-    url = normalize_url(url)
+def _download(url: str, session: requests.Session, allowed, *, robots=False, pdf=True):
+    """Contrôle chaque destination avant la requête, redirections comprises."""
+    types = {'text/plain'} if robots else {'text/html'}
+    if pdf and not robots:
+        types.add('application/pdf')
     for _ in range(4):
-        p = urlparse(url)
-        if not _safe_dns(p.hostname or ''):
+        url = normalize_url(url)
+        if not allowed(url):
+            return None
+        if not _safe_dns(urlparse(url).hostname or ''):
             raise ValueError('Domaine non résolu ou adresse privée.')
         with session.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False, stream=True) as res:
             if 300 <= res.status_code < 400 and res.headers.get('location'):
-                url = normalize_url(urljoin(url, res.headers['location']))
+                url = urljoin(url, res.headers['location'])
                 continue
             res.raise_for_status()
-            if 'text/html' not in res.headers.get('content-type', '').lower():return None
-            length=0
-            data=[]
-            for buf in res.iter_content(32768):
-                length+=len(buf)
-                if length > MAX_BYTES: raise ValueError('Page trop volumineuse.')
-                data.append(buf)
-            # Ne pas accéder à res.apparent_encoding après iter_content():
-            # la réponse a déjà été consommée, et requests lève RuntimeError.
-            body = b''.join(data)
-            return body.decode(res.encoding or 'utf-8', errors='replace')
+            mime = res.headers.get('content-type', '').split(';')[0].strip().lower()
+            if mime == 'application/octet-stream' and PDF_LINK.search(urlparse(url).path):
+                mime = 'application/pdf'
+            if mime not in types:
+                return None
+            limit = MAX_PDF_BYTES if mime == 'application/pdf' else MAX_BYTES
+            data = bytearray()
+            for chunk in res.iter_content(32768):
+                data.extend(chunk)
+                if len(data) > limit:
+                    raise ValueError('Document trop volumineux.')
+            if mime == 'application/pdf' and b'%PDF-' not in data[:1024]:
+                return None
+            body = bytes(data) if mime == 'application/pdf' else data.decode(res.encoding or 'utf-8', errors='replace')
+            return url, mime, body
     return None
 
 
@@ -300,30 +318,153 @@ def _jd_persons(page: Page) -> list[dict]:
                 email=str(item.get('email','')).removeprefix('mailto:')
                 if not EMAIL_RE.fullmatch(email):email=''
                 phone=str(item.get('telephone',''))
-                if not PHONE_RE.search(phone):phone=''
+                if not TEL_VALUE.fullmatch(phone) or not 8 <= len(_phone_key(phone)) <= 15:phone=''
                 contacts.append(_contact(name,role,page.url,role,email,phone,'Source officielle'))
     return contacts
 
 
 
 
+def _phone_key(value: str) -> str:
+    digits = re.sub(r'\D', '', value)
+    return digits[2:] if value.startswith('00') else digits
+
+
+def _unique_coordinates(emails, phones):
+    emails = {value.casefold(): value for value in emails}
+    phones = {_phone_key(value): value for value in phones
+              if 8 <= len(_phone_key(value)) <= 15}
+    return (next(iter(emails.values())) if len(emails) == 1 else '',
+            next(iter(phones.values())) if len(phones) == 1 else '')
+
+
+LOCAL_PHONE = re.compile(r'(?:t[ée]l(?:[ée]phone)?\.?|phone|direct|mobile)\s*:?\s*(0[1-9](?:[ .-]?\d{2}){4})(?!\d)', re.I)
+TEL_VALUE = re.compile(r'(?:\+|00)?\d[\d ().-]{6,20}\d')
+
+
 def _card_coordinates(node):
     """Lit uniquement les coordonnées publiées dans la carte individuelle."""
     text = _clean(node.get_text(' ', strip=True))
     emails = EMAIL_RE.findall(text)
-    phones = PHONE_RE.findall(text)
+    phones = PHONE_RE.findall(text) + LOCAL_PHONE.findall(text)
     for link in node.select('a[href]'):
-        href = link.get('href', '')
+        href = link['href']
         if href.lower().startswith('mailto:'):
             value = unquote(href[7:].split('?')[0]).strip()
-            if EMAIL_RE.fullmatch(value): emails.append(value)
+            if EMAIL_RE.fullmatch(value):
+                emails.append(value)
         elif href.lower().startswith('tel:'):
             value = unquote(href[4:]).strip()
-            if PHONE_RE.fullmatch(value): phones.append(value)
-    # Plusieurs valeurs différentes : l'association exige une vérification.
-    emails = list(dict.fromkeys(emails))
-    phones = list(dict.fromkeys(phones))
-    return (emails[0] if len(emails) == 1 else '', phones[0] if len(phones) == 1 else '')
+            if TEL_VALUE.fullmatch(value):
+                phones.append(value)
+    return _unique_coordinates(emails, phones)
+
+
+def _named_email(email: str, name: str) -> bool:
+    local = re.sub(r'[^a-z0-9]', '', _norm(email.split('@')[0]))
+    parts = re.findall(r'[a-z]+', _norm(name))
+    if len(parts) < 2:
+        return False
+    first, last = parts[0], parts[-1]
+    return local in {first + last, last + first, first[0] + last, last + first[0],
+                     ''.join(parts), ''.join(parts[1:]) + first}
+
+
+def _individual_profile(page: Page) -> list[dict]:
+    """S'appuie sur le titre nominatif et le rôle de la fiche officielle."""
+    main = page.soup.select_one('main, [role="main"]') or page.soup.body
+    if main is None:
+        return []
+    body = BeautifulSoup(str(main), 'html.parser')
+    for element in body.select('header nav, nav, footer, aside, form, script, style, [hidden]'):
+        element.decompose()
+    titles = body.find_all('h1')
+    if len(titles) != 1:
+        return []
+    title = titles[0]
+    name = person_name(title.get_text(' ', strip=True))
+    if not name:
+        return []
+    roles = [c['fonction'] for c in _jd_persons(page) if c['nom'] == name]
+    if not roles:
+        job = title.find_next(attrs={'itemprop': 'jobTitle'})
+        if job and ROLE_RE.search(job.get_text(' ', strip=True)):
+            roles = [_role_from_text(job.get_text(' ', strip=True))]
+    if not roles:
+        following = title.find_next(['p', 'h2', 'h3', 'div'])
+        text = _clean(following.get_text(' ', strip=True)) if following else ''
+        match = ROLE_RE.search(text[:95])
+        if not match or match.start() > 16 or len(text) > 120:
+            return []
+        roles = [_role_from_text(text)]
+    if not roles[0]:
+        return []
+    # Un email nominatif peut se trouver plus bas dans une biographie longue.
+    # Pour un téléphone, exiger un bloc de coordonnées explicitement direct.
+    emails = [email for email in EMAIL_RE.findall(body.get_text(' ', strip=True))
+              if _named_email(email, name)]
+    direct_phones = []
+    for link in body.select('a[href]'):
+        href = link['href']
+        if href.lower().startswith('mailto:'):
+            value = unquote(href[7:].split('?')[0]).strip()
+            if EMAIL_RE.fullmatch(value) and _named_email(value, name):
+                emails.append(value)
+    other_people = {person_name(h.get_text(' ', strip=True)) for h in body.find_all(['h2', 'h3', 'h4'])}
+    if not (other_people - {'', name}):
+        for block in body.select('p, li, address'):
+            text = _clean(block.get_text(' ', strip=True))
+            if len(text) <= 100 and re.match(r'^(?:(?:ligne|tél[ée]phone|tel\.?|phone) )?(?:directe?|mobile)\b', text, re.I):
+                _, phone = _card_coordinates(block)
+                if phone:
+                    direct_phones.append(phone)
+    email, phone = _unique_coordinates(emails, direct_phones)
+    if email or phone:
+        return [_contact(name, roles[0], page.url,
+                         ' — '.join(filter(None, (roles[0], email, phone))),
+                         email, phone, 'Source officielle')]
+    return []
+
+
+def _pdf_contacts(url: str, body: bytes) -> list[dict]:
+    reader = PdfReader(BytesIO(body))
+    if reader.is_encrypted:
+        raise ValueError('PDF chiffré.')
+    contacts = []
+    for number, pdf_page in enumerate(reader.pages[:MAX_PDF_PAGES], start=1):
+        lines = (pdf_page.extract_text() or '').splitlines()
+        for index, line in enumerate(lines):
+            # Les fiches textuelles utilisent un nom sur sa propre ligne, ou
+            # une ligne de tableau avec séparateurs explicites.
+            parts = re.split(r'\s*[|•]\s*|\s+[-–—]\s+| {2,}|\t+', line.strip())
+            name = person_name(parts[0])
+            if not name:
+                continue
+            following = lines[index + 1:index + 4]
+            role_line = parts[1] if len(parts) > 1 else (following.pop(0).strip() if following else '')
+            match = ROLE_RE.search(role_line[:90])
+            if not match or match.start() > 12 or len(role_line) > 100:
+                continue
+            role = _role_from_text(role_line)
+            if not role:
+                continue
+            details = parts[2:]
+            for detail in following:
+                detail = detail.strip()
+                if not re.match(r'^(?:(?:e-?mail|courriel|direct|mobile|phone|t[ée]l(?:[ée]phone)?\.?)\s*:|[+]|00|[^ ]+@)', detail, re.I):
+                    break
+                details.append(detail)
+            emails = [email for detail in details for email in EMAIL_RE.findall(detail)
+                      if _named_email(email, name)]
+            phones = [phone for detail in details
+                      if not re.search(r'\b(?:fax|standard|switchboard)\b', detail, re.I)
+                      for phone in PHONE_RE.findall(detail) + LOCAL_PHONE.findall(detail)]
+            email, phone = _unique_coordinates(emails, phones)
+            if email or phone:
+                evidence = ' — '.join(filter(None, (name, role, email, phone)))
+                contacts.append(_contact(name, role, f'{url}#page={number}',
+                                         evidence, email, phone, 'Source officielle'))
+    return contacts
 
 
 def _structured_contact_cards(page: Page) -> list[dict]:
@@ -360,7 +501,7 @@ def contacts_from_page(page: Page) -> list[dict]:
 
     Never take a role from a large parent listing or across two colleagues.
     """
-    contacts = _jd_persons(page) + _structured_contact_cards(page)
+    contacts = _jd_persons(page) + _structured_contact_cards(page) + _individual_profile(page)
     # Directories: a name in its heading, one role in a SMALL enclosing card.
     for head in page.soup.find_all(['h1', 'h2', 'h3', 'h4', 'strong', 'b']):
         raw_name = _clean(head.get_text(' ', strip=True))
@@ -394,7 +535,8 @@ def contacts_from_page(page: Page) -> list[dict]:
             role = _role_from_text(suffix)
             if not role or len(suffix.split()) > 26:
                 continue
-            email, phone = _card_coordinates(parent)
+            is_container = parent.name in ('[document]', 'html', 'body', 'main') or parent.get('role') == 'main'
+            email, phone = ('', '') if is_container else _card_coordinates(parent)
             person = _contact(name, role, page.url, cardtext[:280],
                               email, phone, 'Source officielle')
             contacts.append(person)
@@ -463,51 +605,98 @@ def merge_contacts(contacts: list[dict], focus: str = 'wealth_asset') -> list[di
 
 
 def crawl_site(start_url: str, search_hits: list[dict], logs: list[str], focus: str = 'wealth_asset') -> list[Page]:
-    url=normalize_url(start_url)
-    domain=base_domain(url)
-    session=requests.Session()
-    rp=robotparser.RobotFileParser()
-    try:
-        robots_url=f'{urlparse(url).scheme}://{urlparse(url).netloc}/robots.txt'
-        r=session.get(robots_url,headers=HEADERS,timeout=(4,7))
-        if r.status_code==200:
-            rp.parse(r.text.splitlines())
-        else:rp=None
-    except requests.RequestException:rp=None
-    candidates=deque([url])
+    url = normalize_url(start_url)
+    domain = base_domain(url)
+    candidates = deque([url])
     for hit in search_hits:
-        if same_site(hit['url'],domain) and in_target_division(hit['url'],focus) and IMPORTANT_PATH.search(hit['url']):candidates.append(hit['url'])
-    seen=set();pages=[]
-    failures=0; blocked=0
-    # Ordre déterministe: liens pertinents d'abord, sans crawl de domaine entier.
-    while candidates and len(pages)<MAX_PAGES:
-        raw=candidates.popleft()
-        try:url=normalize_url(raw)
-        except (ValueError,TypeError):continue
-        if not same_site(url,domain) or url in seen or not in_target_division(url,focus):continue
-        if re.search(r'\.(?:jpg|jpeg|png|gif|svg|mp4|zip|docx?|xlsx?|pdf)(?:\?|$)',url,re.I):continue
-        seen.add(url)
-        if rp is not None and not rp.can_fetch(HEADERS['User-Agent'],url):
+        href = hit['url']
+        hint = href + ' ' + hit.get('title', '')
+        if same_site(href, domain) and (IMPORTANT_PATH.search(hint) or PDF_TOPIC.search(hint)):
+            candidates.append(href)
+    seen = set()
+    pages = []
+    failures = blocked = pdf_attempts = html_count = pdf_count = 0
+    robots_by_origin = {}
+
+    def in_scope(target):
+        return same_site(target, domain) and in_target_division(target, focus)
+
+    def allowed(target):
+        nonlocal blocked
+        if not in_scope(target):
+            return False
+        parsed = urlparse(target)
+        origin = (parsed.scheme, parsed.netloc)
+        if origin not in robots_by_origin:
+            robots_by_origin[origin] = None
+            try:
+                robots = _download(f'{parsed.scheme}://{parsed.netloc}/robots.txt',
+                                   session, lambda u: (urlparse(u).scheme, urlparse(u).netloc) == origin,
+                                   robots=True)
+                if robots:
+                    parser = robotparser.RobotFileParser()
+                    parser.parse(robots[2].splitlines())
+                    robots_by_origin[origin] = parser
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code in (401, 403):
+                    robots_by_origin[origin] = False
+            except (requests.RequestException, ValueError):
+                pass
+        parser = robots_by_origin[origin]
+        if parser is False or (parser is not None and not parser.can_fetch(HEADERS['User-Agent'], target)):
             blocked += 1
-            continue
-        try:html=download_html(url,session)
-        except (requests.RequestException,ValueError,UnicodeError):
-            failures += 1
-            continue
-        if not html:continue
-        page=parse_page(url,html)
-        pages.append(page)
-        fresh=[]
-        for href,anchor in page.links:
-            if not same_site(href,domain) or href in seen or not in_target_division(href,focus):continue
-            if IMPORTANT_PATH.search(urlparse(href).path+' '+anchor):fresh.append(href)
-        # Favorise les pages équipe/sélection, sans nombres de pages demandés à l'utilisateur.
-        fresh=sorted(set(fresh),key=lambda u: (0 if re.search(r'team|equipe|people|leadership|investment|fund.selection',u,re.I) else 1,len(u)))
-        candidates.extend(fresh[:40])
-    logs.append(f'{len(pages)} pages officielles analysées ; {failures} échec(s) de chargement ; {blocked} page(s) exclue(s) par robots.txt.')
-    team_pages=sum(1 for p in pages if re.search(r'team|people|leadership|our-team|equipe|notre.equipe|professionals|investment-team', p.url, re.I))
-    logs.append(f'{team_pages} page(s) avec URL évoquant une équipe ou des dirigeants.')
-    if len(pages)==MAX_PAGES:logs.append('Plafond de sécurité atteint sur le site. Les résultats peuvent être incomplets.')
+            return False
+        return True
+
+    with requests.Session() as session:
+        while candidates and html_count < MAX_PAGES and len(seen) < MAX_FETCHES:
+            try:
+                url = normalize_url(candidates.popleft())
+            except (ValueError, TypeError):
+                continue
+            path = urlparse(url).path
+            if not in_scope(url) or url in seen or re.search(r'\.(?:jpg|jpeg|png|gif|svg|mp4|zip|docx?|xlsx?)$', path, re.I):
+                continue
+            if PDF_LINK.search(path) and pdf_attempts >= MAX_PDFS:
+                continue
+            seen.add(url)
+            try:
+                document = _download(url, session, allowed, pdf=pdf_attempts < MAX_PDFS)
+                if not document:
+                    continue
+                final_url, mime, body = document
+                if mime == 'application/pdf':
+                    pdf_attempts += 1
+                    contacts = _pdf_contacts(final_url, body)
+                    pages.append(Page(final_url, '', BeautifulSoup('', 'html.parser'), pdf_contacts=contacts))
+                    pdf_count += 1
+                    continue
+                page = parse_page(final_url, body)
+            except (requests.RequestException, ValueError, PyPdfError, OverflowError, RecursionError):
+                failures += 1
+                continue
+            html_count += 1
+            pages.append(page)
+            fresh = {}
+            for href, anchor in page.links:
+                if not in_scope(href) or href in seen:
+                    continue
+                path = urlparse(href).path
+                profile_link = person_name(anchor) and all(
+                    token in _norm(unquote(path)) for token in _norm(anchor).split()
+                )
+                hint = path + ' ' + anchor
+                pdf_link = PDF_LINK.search(path)
+                if profile_link or IMPORTANT_PATH.search(hint) or (pdf_link and PDF_TOPIC.search(hint)):
+                    priority = 0 if profile_link else 2 if pdf_link else 1
+                    fresh[href] = min(priority, fresh.get(href, priority))
+            candidates.extend(sorted(fresh, key=lambda href: (fresh[href], len(href), href))[:40])
+    logs.append(f'{html_count} pages HTML et {pdf_count} PDF officiels analysés (texte, {MAX_PDF_PAGES} pages maximum par PDF) ; '
+                f'{failures} échec(s) ; {blocked} URL exclue(s) par robots.txt.')
+    team_pages = sum(1 for p in pages if p.pdf_contacts is None and IMPORTANT_PATH.search(urlparse(p.url).path))
+    logs.append(f'{team_pages} page(s) HTML avec une URL liée aux activités, à l’équipe ou aux contacts.')
+    if html_count == MAX_PAGES or len(seen) == MAX_FETCHES or pdf_attempts == MAX_PDFS:
+        logs.append('Plafond de collecte atteint. Les résultats peuvent être incomplets.')
     return pages
 
 
@@ -530,10 +719,12 @@ def research(url: str, focus: str = 'wealth_asset', company_name: str = '',
         f'site:{domain} gestion équipe sélection fonds CIO',
         f'site:{domain} wealth management open architecture third party funds',
         f'site:{domain} AUM assets under management encours',
+        f'site:{domain} filetype:pdf (investment team OR équipe gestion OR fund contact)',
     ]
     official_hits=lookup(site_queries)
     report(0.25, 'Analyse des pages officielles')
-    pages=crawl_site(url,official_hits,logs,focus)
+    documents = crawl_site(url, official_hits, logs, focus)
+    pages = [page for page in documents if page.pdf_contacts is None]
     if not pages:
         if not company_name.strip():
             raise RuntimeError("Site officiel inaccessible. Renseigne le nom exact de la société pour permettre la recherche Web externe.")
@@ -563,7 +754,7 @@ def research(url: str, focus: str = 'wealth_asset', company_name: str = '',
     all_hits=list({r['url']:r for r in official_hits+other_hits}.values())
     company['sources_externes']=classify_hits(other_hits,name,domain)
     # Un résultat indexé LinkedIn constitue une piste, non un contact confirmé.
-    # Aucune requête n'est effectuée vers LinkedIn ou des pages de profils.
+    # Aucune requête n’est effectuée vers LinkedIn ou d’autres profils externes.
     company['pistes_web']=indexed_people_candidates(other_hits,name)
     # Conservé pour les résultats historiques de l'interface V4.1.
     company['pistes_linkedin']=[p for p in company['pistes_web']
@@ -578,15 +769,14 @@ def research(url: str, focus: str = 'wealth_asset', company_name: str = '',
         logs.append(f'{short} page(s) avec très peu de texte : site éventuellement rendu par JavaScript; une recherche HTML seule ne suffit pas.')
     if any(re.search(r'[\u0590-\u05FF\u0400-\u04FF]',p.text) for p in pages):
         logs.append('Le site contient des écritures hébraïques/cyrilliques : l’extraction actuelle des noms privilégie les noms en alphabet latin et peut en manquer.')
-    pdfs={h for p in pages for h,_ in p.links if re.search(r'\.pdf(?:[?#]|$)',h,re.I)}
-    if pdfs:logs.append(f'{len(pdfs)} PDF(s) repéré(s) mais non analysé(s) dans cette version.')
     logs.append(f"Pistes Web : {len(company['pistes_web'])} personne(s) candidate(s), dont "
                 f"{len(company['pistes_linkedin'])} issue(s) de résultats LinkedIn indexés. "
                 "Aucune page LinkedIn consultée automatiquement.")
     if not company['pistes_web']:
         logs.append('Aucune piste extraite : résultats absents, non indexés, ou titres sans association explicite à la société.')
-    people=[]
-    for page in pages:people.extend(contacts_from_page(page))
+    people = []
+    for document in documents:
+        people.extend(contacts_from_page(document) if document.pdf_contacts is None else document.pdf_contacts)
     people.extend(contacts_from_results(all_hits,name,domain))
     contacts=merge_contacts(people,focus)
     logs.append(f'{len(people)} extractions brutes, {len(contacts)} contacts qualifiés après contrôle/dédoublonnage.')
@@ -594,4 +784,4 @@ def research(url: str, focus: str = 'wealth_asset', company_name: str = '',
     if not contacts:logs.append('Aucun contact public confirmé : ne pas interpréter comme une absence de décideurs.')
     report(1.0, 'Recherche terminée')
     return {'profile':company,'contacts':contacts,'diagnostic':logs,
-            'sources':list(dict.fromkeys([p.url for p in pages]+[h['url'] for h in all_hits]))}
+            'sources':list(dict.fromkeys([p.url for p in documents]+[h['url'] for h in all_hits]))}

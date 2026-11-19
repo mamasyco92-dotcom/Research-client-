@@ -170,8 +170,13 @@ def shortlist(items: list[dict], focus: str = 'wealth_asset') -> list[dict]:
                     -len(x['fonction']))
         preferred = c if rank(c)>rank(previous) else previous
         other = previous if preferred is c else c
-        for field in ('email','telephone'):
+        added = []
+        for field in ('email', 'telephone'):
             if not preferred.get(field) and other.get(field):
                 preferred[field] = other[field]
+                added.append(other[field])
+        if added and other.get('source') and other['source'] != preferred.get('source'):
+            citation = f"Coordonnées ({', '.join(added)}) : {other['source']}"
+            preferred['preuve'] = ' — '.join(filter(None, (citation, preferred.get('preuve'))))
         result[key] = preferred
     return sorted(result.values(), key=lambda x: (x['priorite']!='Haute', x['nom']))

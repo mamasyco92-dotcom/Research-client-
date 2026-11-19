@@ -95,3 +95,24 @@ def test_backup_closes_connections_before_removing_temporary_directory(tmp_path,
     monkeypatch.setattr(tempfile, 'TemporaryDirectory', CheckedDirectory)
     assert storage.database_backup().startswith(b'SQLite format 3')
     assert len(connections) == 2
+
+
+def test_export_contains_exact_saved_contacts_and_companies_without_contacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, 'DB_PATH', tmp_path / 'export.sqlite3')
+    person = dict(nom='Marie Dupont', fonction='Portfolio Manager', email='marie@example.org',
+                  telephone='+33123456789', role_decisionnel='', priorite='Moyenne',
+                  source='https://example.org/team', statut='Source officielle', preuve='')
+    alpha = storage.save_research(dict(profile=dict(nom='Alpha', url='https://example.org'),
+                                       contacts=[person], diagnostic=[]))
+    beta = storage.save_research(dict(profile=dict(nom='Beta', url='https://example.org'),
+                                      contacts=[{**person, 'email': 'other@example.org'}], diagnostic=[]))
+    gamma = storage.save_research(dict(profile=dict(nom='Gamma', url='https://example.org'),
+                                       contacts=[], diagnostic=[]))
+    assert [(row['societe'], row['nom'], row['email']) for row in storage.export_contacts()] == [
+        ('Alpha', 'Marie Dupont', 'marie@example.org'),
+        ('Beta', 'Marie Dupont', 'other@example.org'),
+        ('Gamma', None, None),
+    ]
+    assert [row['societe'] for row in storage.export_contacts([alpha, gamma])] == ['Alpha', 'Gamma']
+    assert [row['email'] for row in storage.export_contacts([beta])] == ['other@example.org']
+    assert storage.export_contacts([]) == []

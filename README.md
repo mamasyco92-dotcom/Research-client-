@@ -36,7 +36,7 @@ Installation éventuelle des dépendances :
 - Le filtrage repose sur des règles conservatrices : il peut manquer des contacts pertinents et peut nécessiter des corrections manuelles. Une mention « Source officielle » indique l'origine de l'information, **pas une vérification actuelle de la fonction**.
 - Une société d'asset management ne représente pas automatiquement un acheteur de fonds UCITS externes : vérifier séparément son architecture ouverte et les responsabilités réelles de la personne.
 - Les emails et téléphones professionnels restent vides lorsqu'aucun numéro ou email public n'est identifié ; aucune donnée n'est devinée.
-- En cas de site bloqué, aucune donnée ne sera forcée. Les documents PDF ne sont pas lus en V2.
+- En cas de site bloqué, aucune donnée ne sera forcée.
 - Respecter les règles de prospection professionnelle, la politique des sites et les exigences de protection des données. SQLite est stockée localement sans chiffrement.
 
 ## Tests techniques
@@ -71,4 +71,10 @@ python3 -m venv /workspace/venvs/research
 Le cloud est déjà isolé : utiliser le checkout existant, sans créer de worktree.
 La base `recherches.sqlite3` reste locale et est exclue de Git. Sauvegarder la base existante avant une mise à jour ; copier les fichiers de code et le nouveau module `prospect_filters.py`, jamais remplacer la base par une base de démonstration.
 
-Les tests utilisent des bases temporaires et des réponses Web simulées. Ils vérifient le moteur, la séparation des personnes, le stockage et le filtrage de l'interface ; ils ne mesurent pas la couverture réelle des moteurs de recherche. La recherche réelle nécessite les accès réseau aux moteurs, à GLEIF et aux domaines des sociétés ciblées. Serper reste facultatif. Les PDF et les pages nécessitant JavaScript ne sont pas analysés.
+Les tests utilisent des bases temporaires et des réponses Web simulées. Ils vérifient le moteur, la séparation des personnes, le stockage et le filtrage de l'interface ; ils ne mesurent pas la couverture réelle des moteurs de recherche. La recherche réelle nécessite les accès réseau aux moteurs, à GLEIF et aux domaines des sociétés ciblées. Serper reste facultatif. Les pages nécessitant JavaScript et les PDF uniquement numérisés (images) ne sont pas analysés.
+
+
+### Export des sociétés et collecte des coordonnées
+
+- Dans **Contacts**, ouvre **Exporter les contacts par société**. Choisis une ou plusieurs sociétés, ou coche **Toutes les sociétés enregistrées**. Le CSV Excel indique la société sur chaque ligne, conserve une ligne pour les sociétés sans contact et exporte les contacts enregistrés indépendamment des filtres à l’écran.
+- La recherche peut suivre les fiches nominatives et lire les PDF textuels pertinents du site officiel avec pypdf, sans clé ni service payant. Elle analyse jusqu’à six PDF, dans la limite de douze pages par document. Elle conserve les coordonnées publiques pouvant être rattachées au nom et à la fonction, ainsi que la source (page du PDF lorsqu’elle est disponible).

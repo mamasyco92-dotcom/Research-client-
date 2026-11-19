@@ -6,7 +6,8 @@ from urllib.parse import urlparse
 import streamlit as st
 
 from research import research, normalize_url
-from storage import companies, get_company, save_research, update_contact, remove_contact, database_backup
+from storage import (companies, get_company, save_research, update_contact,
+                     remove_contact, database_backup, export_contacts)
 from contact_quality import shortlist, folded
 from prospect_filters import TARGETS, filter_prospects
 
@@ -281,6 +282,24 @@ else:
         st.download_button('Exporter les personnes affichées (CSV Excel)',
                            csv_bytes(filtered,columns,labels),
                            file_name='contacts_et_pistes_web.csv',mime='text/csv')
+        with st.expander('Exporter les contacts par société'):
+            export_all = st.checkbox('Toutes les sociétés enregistrées')
+            company_names = {entry['id']: f"{entry['name']} — {urlparse(entry['url']).hostname}"
+                             for entry in entries}
+            selected_ids = st.multiselect(
+                'Sociétés à exporter', ids, default=[choice], disabled=export_all,
+                format_func=company_names.__getitem__, key='export_company_ids',
+            )
+            if export_all:
+                selected_ids = None
+            st.caption('Le CSV inclut les contacts enregistrés. Les sociétés sans contact ont une ligne dédiée.')
+            st.download_button(
+                'Télécharger les contacts des sociétés (CSV Excel)',
+                csv_bytes(export_contacts(selected_ids), ['societe', *CONTACT_VIEW],
+                          {'societe': 'Société', **CONTACT_LABELS}),
+                file_name='societes_et_contacts.csv', mime='text/csv',
+                disabled=selected_ids == [],
+            )
         if candidates:
             with st.expander('Lire les extraits des résultats Web et vérifier les sources'):
                 st.dataframe([{'Nom':x.get('nom',''), 'Fonction indicative':x.get('fonction',''),

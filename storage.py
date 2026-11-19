@@ -1,5 +1,6 @@
 """Stockage local SQLite indépendant du fichier Excel VBA."""
 from __future__ import annotations
+from contextlib import closing
 import json
 import hashlib
 import unicodedata
@@ -102,6 +103,11 @@ def save_research(bundle: dict) -> int:
                          'phone':prev['phone'] or c['telephone'],'decision':prev['decision'] or c['role_decisionnel'],
                          'priority':prev['priority'] or c['priorite'],'source':prev['source'] or c['source'],
                          'status':prev['status'] or c['statut'],'evidence':prev['evidence'] or c['preuve']}
+                added = [c[field] for column, field in (('email', 'email'), ('phone', 'telephone'))
+                         if not prev[column] and c[field]]
+                if added and c['source'] != prev['source']:
+                    citation = f"Coordonnées ({', '.join(added)}) : {c['source']}"
+                    updates['evidence'] = ' — '.join(filter(None, (prev['evidence'], citation, c['preuve'])))
                 con.execute('''UPDATE contacts SET role=:role,email=:email,phone=:phone,
                      decision=:decision,priority=:priority,source=:source,status=:status,evidence=:evidence
                      WHERE id=:id''',{**updates,'id':prev['id']})
@@ -129,6 +135,24 @@ def get_company(company_id:int) -> tuple[dict, list[dict], list[str]]:
         return json.loads(row['profile_json']),contacts,json.loads(row['diagnostic_json'])
 
 
+def export_contacts(company_ids: list[int] | None = None) -> list[dict]:
+    """Une ligne par contact et une ligne société quand elle est sans contact."""
+    if company_ids == []:
+        return []
+    query = """
+        SELECT companies.name AS societe, contacts.name AS nom, role AS fonction,
+               email, phone AS telephone, decision AS role_decisionnel,
+               priority AS priorite, source, status AS statut
+        FROM companies LEFT JOIN contacts ON contacts.company_id = companies.id
+    """
+    if company_ids is not None:
+        placeholders = ','.join('?' for _ in company_ids)
+        query += f' WHERE companies.id IN ({placeholders})'
+    query += ' ORDER BY companies.name COLLATE NOCASE, companies.id, contacts.name COLLATE NOCASE, contacts.id'
+    with closing(connect()) as con:
+        return [dict(row) for row in con.execute(query, company_ids or [])]
+
+
 def update_contact(contact_id:int, changes:dict):
     whitelist={'name','role','email','phone','decision','priority','status'}
     vals={k:str(v or '') for k,v in changes.items() if k in whitelist}
@@ -143,7 +167,6 @@ def remove_contact(contact_id:int):
 
 def database_backup() -> bytes:
     """Instantané SQLite cohérent, y compris si le journal WAL est actif."""
-    from contextlib import closing
     import tempfile
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / 'recherches.sqlite3'
